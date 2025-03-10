@@ -6,7 +6,7 @@
 **郑重声明：文中所涉及的技术、思路和工具仅供以安全为目的的学习交流使用，任何人不得将其用于非法用途以及盈利等目的，否则后果自负**
 ## 工具简介
 
-看 GitHub 上发现一个大佬搞的好玩的工具，用 AI 自动绕过 WAF 完成 XSS 漏洞测试。经过编译后，我感觉效果略有不足且存在一些小 bug，所以对原项目进行了二次开发（造轮子），优化了代码和 AI 交互词，完善了功能。为此，我将其命名为Chypass_pro。
+看 GitHub 上发现一个好玩的工具，用 AI 自动绕过 WAF 完成 XSS 漏洞测试。经过编译后，我感觉效果略有不足且存在一些小 bug，所以对原项目进行了二次开发（造轮子），优化了代码和 AI 交互词，完善了功能。为此，我将其命名为Chypass_pro。
 
 原项目地址：https://aizhuanqian.com](https://github.com/hmKunlun/Chypass
 
@@ -34,6 +34,8 @@ Chypass_pro 调用 AI 自动化生成绕过 WAF 的 XSS payload。
 
 3. **配置 API Key**  
    导入插件后，请先配置 AI 的 API Key。建议使用 DeepSeek 或 Qwen-Max，因为它们对代码的分析和理解较为准确。API Key 支持持久化保存，方便下次自动加载。
+![image](https://github.com/user-attachments/assets/b197ce9d-3d41-40eb-a7f6-9eb98a089d94)
+![image](https://github.com/user-attachments/assets/4bdaa40e-59eb-42bf-90fa-53e4e84579e1)
 
 ---
 
