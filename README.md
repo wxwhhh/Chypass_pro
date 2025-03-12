@@ -1,4 +1,4 @@
-![image](https://github.com/user-attachments/assets/0d4098e4-814c-4fe7-91a8-2aef6443b0e7)# Chypass_pro
+# Chypass_pro
 
 > 一个基于 AI 自动绕过 WAF、完成 XSS 漏洞测试的 Burp Suite 扩展
 > 
