@@ -9,7 +9,7 @@
 
 看 GitHub 上发现一个好玩的工具，用 AI 自动绕过 WAF 完成 XSS 漏洞测试。经过编译后，我感觉效果略有不足且存在一些小 bug，所以对原项目进行了二次开发（造轮子），优化了代码和 AI 交互词，完善了功能。为此，我将其命名为Chypass_pro。
 
-原项目地址：https://aizhuanqian.com
+原项目地址：[https://aizhuanqian.com](https://github.com/hmKunlun/Chypass)
 
 ---
 
